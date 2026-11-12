@@ -1,0 +1,702 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  LibraCloud - cloud-native library management system. Creates the complete AWS environment:
+  EC2 (Docker microservices), RDS PostgreSQL, S3, CloudFront, Lambda + EventBridge (nightly overdue job),
+  SNS (email), Secrets Manager, CloudWatch (logs, metrics, alarms, dashboard).
+  Designed for AWS Academy Learner Lab (uses the existing LabRole / LabInstanceProfile).
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: 'Application' }
+        Parameters: [GitHubRepo, GitBranch, ImagePrefix, AdminEmail, AdminPassword, AlertEmail]
+      - Label: { default: 'Network' }
+        Parameters: [VpcId, SubnetIds, CloudFrontPrefixListId]
+      - Label: { default: 'Sizing (Learner Lab limits: EC2 up to large, RDS up to medium)' }
+        Parameters: [InstanceType, DBInstanceClass, DBEngineVersion, KeyName, LatestAmiId]
+      - Label: { default: 'Learner Lab IAM (do not change)' }
+        Parameters: [LabRoleName, LabInstanceProfileName]
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Description: Your public GitHub repository, as owner/name (e.g. navya/libracloud). The EC2 setup script is downloaded from it.
+    AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+  GitBranch:
+    Type: String
+    Default: main
+  ImagePrefix:
+    Type: String
+    Description: Where CI/CD pushes Docker images, in lower case (e.g. ghcr.io/navya).
+    AllowedPattern: '^[a-z0-9./_-]+$'
+  AdminEmail:
+    Type: String
+    Default: admin@libracloud.local
+    Description: Login email for the first librarian account.
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 64
+    AllowedPattern: '^[A-Za-z0-9!#%&*+,.:;=?^_~-]+$'
+    Description: Password for the first librarian (8+ characters, letters and numbers; no spaces, quotes, $ or backslashes).
+  AlertEmail:
+    Type: String
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    Description: Your email. Receives CloudWatch alarms and library notifications (confirm the two SNS subscription emails).
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Use the default VPC.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Choose at least TWO public subnets in different Availability Zones (default VPC subnets are public). EC2 uses the first one.
+  CloudFrontPrefixListId:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional but recommended. ID of the managed prefix list "com.amazonaws.global.cloudfront.origin-facing"
+      (VPC console > Managed prefix lists). When set, EC2 only accepts web traffic from CloudFront.
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t4g.micro, db.t4g.small]
+  DBEngineVersion:
+    Type: String
+    Default: '17.6'
+    AllowedPattern: '^1[5-9](\.[0-9]+)?$'
+    Description: PostgreSQL version. If AWS reports it is unavailable, choose another 17.x or 16.x listed in the RDS console.
+  KeyName:
+    Type: String
+    Default: vockey
+    Description: EC2 key pair (vockey exists in us-east-1). Leave empty to rely on Session Manager only.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  LabRoleName:
+    Type: String
+    Default: LabRole
+  LabInstanceProfileName:
+    Type: String
+    Default: LabInstanceProfile
+
+Conditions:
+  HasKey: !Not [!Equals [!Ref KeyName, '']]
+  RestrictToCloudFront: !Not [!Equals [!Ref CloudFrontPrefixListId, '']]
+  IsUsEast1: !Equals [!Ref 'AWS::Region', us-east-1]
+
+Resources:
+  # ------------------------------------------------------------------ Secrets Manager
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/db'
+      Description: LibraCloud RDS master credentials (generated, never stored in code)
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"libracloud"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+      Tags: [{ Key: Project, Value: LibraCloud }]
+
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/app'
+      Description: LibraCloud JWT signing key and first librarian login
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"ADMIN_EMAIL":"${AdminEmail}","ADMIN_PASSWORD":"${AdminPassword}"}'
+        GenerateStringKey: JWT_SECRET
+        PasswordLength: 48
+        ExcludePunctuation: true
+      Tags: [{ Key: Project, Value: LibraCloud }]
+
+  InternalKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/internal-api-key'
+      Description: Key used between LibraCloud services and by the scheduled Lambda
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: INTERNAL_API_KEY
+        PasswordLength: 40
+        ExcludePunctuation: true
+      Tags: [{ Key: Project, Value: LibraCloud }]
+
+  # ------------------------------------------------------------------ Networking / security groups
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: LibraCloud web server - HTTP only (no SSH; use Session Manager)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - !If
+          - RestrictToCloudFront
+          - { IpProtocol: tcp, FromPort: 80, ToPort: 80, SourcePrefixListId: !Ref CloudFrontPrefixListId, Description: CloudFront only }
+          - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: HTTP (protected by CloudFront secret header) }
+      Tags: [{ Key: Name, Value: libracloud-web }, { Key: Project, Value: LibraCloud }]
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: LibraCloud database - PostgreSQL from the web server only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref WebSecurityGroup, Description: From EC2 only }
+      Tags: [{ Key: Name, Value: libracloud-db }, { Key: Project, Value: LibraCloud }]
+
+  # ------------------------------------------------------------------ RDS PostgreSQL
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: LibraCloud database subnets
+      SubnetIds: !Ref SubnetIds
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-db'
+      Engine: postgres
+      EngineVersion: !Ref DBEngineVersion
+      DBInstanceClass: !Ref DBInstanceClass
+      DBName: libracloud
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+      AllocatedStorage: '20'
+      StorageType: gp2
+      StorageEncrypted: true
+      PubliclyAccessible: false
+      MultiAZ: false                         # Multi-AZ is not available in Learner Lab
+      BackupRetentionPeriod: 1               # daily automated backup + point-in-time recovery
+      PreferredBackupWindow: '18:00-18:30'   # 23:30 IST
+      PreferredMaintenanceWindow: 'sun:19:00-sun:19:30'
+      AutoMinorVersionUpgrade: true
+      MonitoringInterval: 0                  # enhanced monitoring not supported in Learner Lab
+      EnablePerformanceInsights: false
+      DeletionProtection: false
+      CopyTagsToSnapshot: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      Tags: [{ Key: Project, Value: LibraCloud }]
+
+  DbSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DbSecret
+      TargetId: !Ref Database
+      TargetType: AWS::RDS::DBInstance
+
+  # ------------------------------------------------------------------ S3 (covers, e-books, datasets)
+  AssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+      Tags: [{ Key: Project, Value: LibraCloud }]
+
+  AssetsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AssetsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudFrontReadsCovers
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub '${AssetsBucket.Arn}/covers/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt AssetsBucket.Arn, !Sub '${AssetsBucket.Arn}/*']
+            Condition: { Bool: { 'aws:SecureTransport': 'false' } }
+
+  # ------------------------------------------------------------------ SNS
+  NotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-notifications'
+      DisplayName: LibraCloud Library
+      Subscription: [{ Protocol: email, Endpoint: !Ref AlertEmail }]
+      Tags: [{ Key: Project, Value: LibraCloud }]
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alerts'
+      DisplayName: LibraCloud Alerts
+      Subscription: [{ Protocol: email, Endpoint: !Ref AlertEmail }]
+      Tags: [{ Key: Project, Value: LibraCloud }]
+
+  # ------------------------------------------------------------------ CloudWatch Logs
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${AWS::StackName}/app'
+      RetentionInDays: 14
+
+  DeployLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${AWS::StackName}/deploy'
+      RetentionInDays: 30
+
+  # Every container start logs "service_started" -> counted as a deployment.
+  DeploymentsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref AppLogGroup
+      FilterPattern: '{ $.msg = "service_started" }'
+      MetricTransformations:
+        - { MetricNamespace: LibraCloud, MetricName: ServiceStarts, MetricValue: '1', DefaultValue: 0 }
+
+  Gateway5xxMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref AppLogGroup
+      FilterPattern: '{ $.service = "gateway" && $.status >= 500 }'
+      MetricTransformations:
+        - { MetricNamespace: LibraCloud, MetricName: Gateway5xx, MetricValue: '1', DefaultValue: 0 }
+
+  GatewayRequestsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref AppLogGroup
+      FilterPattern: '{ $.service = "gateway" && $.msg = "access" }'
+      MetricTransformations:
+        - { MetricNamespace: LibraCloud, MetricName: GatewayRequests, MetricValue: '1', DefaultValue: 0 }
+
+  # ------------------------------------------------------------------ EC2 (Docker host)
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        IamInstanceProfile: { Name: !Ref LabInstanceProfileName }
+        SecurityGroupIds: [!Ref WebSecurityGroup]
+        MetadataOptions:
+          HttpTokens: required          # IMDSv2 only (protects instance credentials)
+          HttpPutResponseHopLimit: 2    # lets containers use the instance role
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: 20, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+        TagSpecifications:
+          - ResourceType: volume
+            Tags: [{ Key: Project, Value: LibraCloud }]
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euo pipefail
+              exec > >(tee -a /var/log/libracloud-setup.log) 2>&1
+              mkdir -p /etc/libracloud
+              cat > /etc/libracloud/stack.env <<'EOF'
+              AWS_REGION=${AWS::Region}
+              STACK_NAME=${AWS::StackName}
+              REPO_RAW=https://raw.githubusercontent.com/${GitHubRepo}/${GitBranch}
+              IMAGE_PREFIX=${ImagePrefix}
+              LOG_GROUP=${AppLogGroup}
+              DEPLOY_LOG_GROUP=${DeployLogGroup}
+              DB_HOST=${Database.Endpoint.Address}
+              DB_SECRET_ARN=${DbSecret}
+              APP_SECRET_ARN=${AppSecret}
+              INTERNAL_SECRET_ARN=${InternalKeySecret}
+              S3_BUCKET=${AssetsBucket}
+              SNS_TOPIC_ARN=${NotificationsTopic}
+              ORIGIN_VERIFY=${OriginSecret}
+              EOF
+              curl -fsSL --retry 5 "https://raw.githubusercontent.com/${GitHubRepo}/${GitBranch}/scripts/ec2-setup.sh" -o /usr/local/bin/libracloud-setup
+              chmod +x /usr/local/bin/libracloud-setup
+              /usr/local/bin/libracloud-setup
+            - OriginSecret: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
+
+  WebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Select [0, !Ref SubnetIds]
+      KeyName: !If [HasKey, !Ref KeyName, !Ref 'AWS::NoValue']
+      Tags: [{ Key: Name, Value: libracloud-web }, { Key: Project, Value: LibraCloud }]
+
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref WebServer
+      Tags: [{ Key: Name, Value: libracloud-web }, { Key: Project, Value: LibraCloud }]
+
+  # ------------------------------------------------------------------ CloudFront (HTTPS + CDN)
+  CoversOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-covers-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: LibraCloud library
+        Enabled: true
+        HttpVersion: http2and3
+        PriceClass: PriceClass_200            # includes edge locations in India
+        Origins:
+          - Id: ec2-gateway
+            DomainName: !Join
+              - ''
+              - - 'ec2-'
+                - !Join ['-', !Split ['.', !GetAtt ElasticIP.PublicIp]]
+                - !If [IsUsEast1, '.compute-1.amazonaws.com', !Sub '.${AWS::Region}.compute.amazonaws.com']
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+              OriginReadTimeout: 30
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
+          - Id: s3-covers
+            DomainName: !GetAtt AssetsBucket.RegionalDomainName
+            S3OriginConfig: { OriginAccessIdentity: '' }
+            OriginAccessControlId: !GetAtt CoversOAC.Id
+        DefaultCacheBehavior:            # website + API: not cached
+          TargetOriginId: ec2-gateway
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad          # Managed-CachingDisabled
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # Managed-AllViewerExceptHostHeader
+        CacheBehaviors:
+          - PathPattern: /assets/*       # hashed JS/CSS: cached at the edge
+            TargetOriginId: ec2-gateway
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6        # Managed-CachingOptimized
+          - PathPattern: /covers/*       # book covers straight from S3
+            TargetOriginId: s3-covers
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+      Tags: [{ Key: Project, Value: LibraCloud }]
+
+  # ------------------------------------------------------------------ Lambda + EventBridge (nightly overdue job)
+  OverdueJobLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-overdue-job'
+      RetentionInDays: 14
+
+  OverdueJobFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: OverdueJobLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-overdue-job'
+      Description: Nightly - marks overdue loans, recalculates fines, sends due-date reminders
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}'
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          API_URL: !Sub 'https://${Distribution.DomainName}'
+          INTERNAL_SECRET_ARN: !Ref InternalKeySecret
+      Code:
+        ZipFile: |
+          const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
+          const sm = new SecretsManagerClient({});
+          let key;
+          exports.handler = async () => {
+            if (!key) {
+              const s = await sm.send(new GetSecretValueCommand({ SecretId: process.env.INTERNAL_SECRET_ARN }));
+              key = JSON.parse(s.SecretString).INTERNAL_API_KEY;
+            }
+            const url = `${process.env.API_URL}/api/circulation/internal/overdue-run`;
+            const res = await fetch(url, { method: 'POST', headers: { 'x-internal-key': key }, signal: AbortSignal.timeout(50000) });
+            const body = await res.text();
+            console.log(JSON.stringify({ msg: 'overdue_job', status: res.status, body: body.slice(0, 1000) }));
+            if (!res.ok) throw new Error(`Overdue job failed: HTTP ${res.status}`);
+            return JSON.parse(body);
+          };
+      Tags: [{ Key: Project, Value: LibraCloud }]
+
+  OverdueJobSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-nightly-overdue'
+      Description: Runs the overdue/fines job every night at 00:00 IST (18:30 UTC)
+      ScheduleExpression: cron(30 18 * * ? *)
+      State: ENABLED
+      Targets:
+        - Id: overdue-job
+          Arn: !GetAtt OverdueJobFunction.Arn
+          RetryPolicy: { MaximumRetryAttempts: 2, MaximumEventAgeInSeconds: 3600 }
+
+  OverdueJobPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OverdueJobFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OverdueJobSchedule.Arn
+
+  # ------------------------------------------------------------------ CloudWatch alarms
+  HighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ec2-high-cpu'
+      AlarmDescription: EC2 CPU above 80% for 10 minutes
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: InstanceId, Value: !Ref WebServer }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+  StatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ec2-status-check'
+      AlarmDescription: EC2 instance or system status check failing
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions: [{ Name: InstanceId, Value: !Ref WebServer }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+  MemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ec2-memory'
+      AlarmDescription: EC2 memory above 85% (CloudWatch agent)
+      Namespace: CWAgent
+      MetricName: mem_used_percent
+      Dimensions: [{ Name: InstanceId, Value: !Ref WebServer }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+
+  DbCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-rds-high-cpu'
+      AlarmDescription: RDS CPU above 80% for 10 minutes
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref Database }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlertsTopic]
+
+  DbStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-rds-low-storage'
+      AlarmDescription: RDS free storage below 2 GB
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref Database }]
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2147483648
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [!Ref AlertsTopic]
+
+  ServerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-5xx-errors'
+      AlarmDescription: 5 or more server errors (HTTP 5xx) in 5 minutes
+      Namespace: LibraCloud
+      MetricName: Gateway5xx
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+  SlowCatalogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-catalog-slow'
+      AlarmDescription: Catalogue p95 response time above 1 second for 15 minutes (SLA target)
+      Namespace: LibraCloud
+      MetricName: Latency
+      Dimensions: [{ Name: Service, Value: catalog-service }]
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+
+  OverdueJobErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-overdue-job-failed'
+      AlarmDescription: The nightly overdue/fines Lambda failed
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref OverdueJobFunction }]
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+
+  # ------------------------------------------------------------------ CloudWatch dashboard
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            { "type": "text", "x": 0, "y": 0, "width": 24, "height": 1,
+              "properties": { "markdown": "## LibraCloud - service health, performance and library activity" } },
+            { "type": "metric", "x": 0, "y": 1, "width": 8, "height": 6,
+              "properties": { "title": "Requests per service (per minute)", "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["LibraCloud", "Requests", "Service", "catalog-service"],
+                  ["...", "circulation-service"],
+                  ["...", "auth-service"],
+                  ["...", "notification-service"] ] } },
+            { "type": "metric", "x": 8, "y": 1, "width": 8, "height": 6,
+              "properties": { "title": "Response time p95 (ms)", "region": "${AWS::Region}", "stat": "p95", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["LibraCloud", "Latency", "Service", "catalog-service"],
+                  ["...", "circulation-service"],
+                  ["...", "auth-service"],
+                  ["...", "notification-service"] ],
+                "annotations": { "horizontal": [ { "label": "SLA target 1000 ms", "value": 1000 } ] } } },
+            { "type": "metric", "x": 16, "y": 1, "width": 8, "height": 6,
+              "properties": { "title": "Errors (5xx)", "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["LibraCloud", "Gateway5xx", { "label": "Gateway 5xx" }],
+                  ["LibraCloud", "Errors5xx", "Service", "catalog-service"],
+                  ["...", "circulation-service"],
+                  ["...", "auth-service"] ] } },
+            { "type": "metric", "x": 0, "y": 7, "width": 8, "height": 6,
+              "properties": { "title": "EC2 CPU and memory (%)", "region": "${AWS::Region}", "period": 60, "view": "timeSeries", "yAxis": { "left": { "min": 0, "max": 100 } },
+                "metrics": [
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${WebServer}", { "label": "CPU", "stat": "Average" }],
+                  ["CWAgent", "mem_used_percent", "InstanceId", "${WebServer}", { "label": "Memory", "stat": "Average" }] ] } },
+            { "type": "metric", "x": 8, "y": 7, "width": 8, "height": 6,
+              "properties": { "title": "RDS database", "region": "${AWS::Region}", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${Database}", { "label": "CPU %", "stat": "Average" }],
+                  ["AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "${Database}", { "label": "Connections", "stat": "Average", "yAxis": "right" }] ] } },
+            { "type": "metric", "x": 16, "y": 7, "width": 8, "height": 6,
+              "properties": { "title": "CloudFront", "region": "us-east-1", "period": 300, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/CloudFront", "Requests", "Region", "Global", "DistributionId", "${Distribution}", { "stat": "Sum", "label": "Requests" }],
+                  ["AWS/CloudFront", "5xxErrorRate", "Region", "Global", "DistributionId", "${Distribution}", { "stat": "Average", "label": "5xx rate %", "yAxis": "right" }] ] } },
+            { "type": "metric", "x": 0, "y": 13, "width": 12, "height": 6,
+              "properties": { "title": "Library activity (per hour)", "region": "${AWS::Region}", "stat": "Sum", "period": 3600, "view": "timeSeries",
+                "metrics": [
+                  ["LibraCloud", "BooksIssued", "Service", "circulation-service"],
+                  ["LibraCloud", "BooksReturned", "Service", "circulation-service"],
+                  ["LibraCloud", "Searches", "Service", "catalog-service"],
+                  ["LibraCloud", "Logins", "Service", "auth-service"],
+                  ["LibraCloud", "LoginFailures", "Service", "auth-service"],
+                  ["LibraCloud", "NotificationsSent", "Service", "notification-service"] ] } },
+            { "type": "metric", "x": 12, "y": 13, "width": 6, "height": 6,
+              "properties": { "title": "Overdue loans and nightly job", "region": "${AWS::Region}", "period": 3600, "view": "timeSeries",
+                "metrics": [
+                  ["LibraCloud", "OverdueLoans", "Service", "circulation-service", { "stat": "Maximum", "label": "Overdue loans" }],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${OverdueJobFunction}", { "stat": "Sum", "label": "Job runs", "yAxis": "right" }],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${OverdueJobFunction}", { "stat": "Sum", "label": "Job errors", "yAxis": "right" }] ] } },
+            { "type": "metric", "x": 18, "y": 13, "width": 6, "height": 6,
+              "properties": { "title": "Deployments (container starts)", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "bar",
+                "metrics": [ ["LibraCloud", "ServiceStarts"] ] } },
+            { "type": "log", "x": 0, "y": 19, "width": 24, "height": 6,
+              "properties": { "title": "Deployment history - which service version started when", "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '${AppLogGroup}' | filter msg = \"service_started\" | fields @timestamp, service, version | sort @timestamp desc | limit 25" } },
+            { "type": "alarm", "x": 0, "y": 25, "width": 24, "height": 3,
+              "properties": { "title": "Alarms", "alarms": [
+                "${HighCpuAlarm.Arn}", "${StatusCheckAlarm.Arn}", "${MemoryAlarm.Arn}", "${DbCpuAlarm.Arn}",
+                "${DbStorageAlarm.Arn}", "${ServerErrorsAlarm.Arn}", "${SlowCatalogAlarm.Arn}", "${OverdueJobErrorsAlarm.Arn}" ] } }
+          ]
+        }
+
+Outputs:
+  WebsiteURL:
+    Description: Open this to use LibraCloud (HTTPS through CloudFront)
+    Value: !Sub 'https://${Distribution.DomainName}'
+  ElasticIP:
+    Description: Public IP of the EC2 server (direct access is blocked - use the WebsiteURL)
+    Value: !GetAtt ElasticIP.PublicIp
+  InstanceId:
+    Description: Connect with Session Manager (EC2 console > Connect > Session Manager)
+    Value: !Ref WebServer
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  AssetsBucketName:
+    Description: Upload datasets here (s3://<bucket>/datasets/books.csv)
+    Value: !Ref AssetsBucket
+  NotificationsTopicArn:
+    Value: !Ref NotificationsTopic
+  OverdueJobFunctionName:
+    Description: Test it from the Lambda console (Test button)
+    Value: !Ref OverdueJobFunction
+  DashboardURL:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-dashboard'
+  AppSecretName:
+    Description: Secrets Manager secret with the librarian login and JWT key
+    Value: !Sub '${AWS::StackName}/app'

@@ -1,0 +1,82 @@
+# LibraCloud - local development
+#   docker compose up --build        then open http://localhost:8080
+#   Librarian login: admin@libracloud.local / Admin@12345
+#
+# Same containers as on AWS, except PostgreSQL runs locally instead of Amazon RDS
+# and uploads are saved to a Docker volume instead of Amazon S3.
+
+x-service: &service
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+  mem_limit: 256m
+
+x-env: &env
+  PGHOST: postgres
+  PGUSER: libracloud
+  PGPASSWORD: libracloud
+  PGDATABASE: libracloud
+  JWT_SECRET: local-dev-jwt-secret-change-me
+  INTERNAL_API_KEY: local-dev-internal-key
+  TRUST_PROXY: "1"
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: libracloud
+      POSTGRES_PASSWORD: libracloud
+      POSTGRES_DB: libracloud
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U libracloud"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  auth:
+    <<: *service
+    build: { context: ., dockerfile: services/Dockerfile, args: { SERVICE: auth, VERSION: local } }
+    environment:
+      <<: *env
+      ADMIN_EMAIL: admin@libracloud.local
+      ADMIN_PASSWORD: Admin@12345
+
+  catalog:
+    <<: *service
+    build: { context: ., dockerfile: services/Dockerfile, args: { SERVICE: catalog, VERSION: local } }
+    environment:
+      <<: *env
+      UPLOAD_DIR: /srv/services/catalog/uploads
+    volumes:
+      - uploads:/srv/services/catalog/uploads
+      - ./data:/data:ro          # put Kaggle CSV files in ./data to import them
+
+  circulation:
+    <<: *service
+    build: { context: ., dockerfile: services/Dockerfile, args: { SERVICE: circulation, VERSION: local } }
+    environment:
+      <<: *env
+
+  notification:
+    <<: *service
+    build: { context: ., dockerfile: services/Dockerfile, args: { SERVICE: notification, VERSION: local } }
+    environment:
+      <<: *env
+
+  gateway:
+    build: { context: ., dockerfile: gateway/Dockerfile, args: { VERSION: local } }
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    environment:
+      ORIGIN_VERIFY: ""
+    depends_on: [auth, catalog, circulation, notification]
+
+volumes:
+  pgdata:
+  uploads:

@@ -1,0 +1,14 @@
+{
+  "name": "@libracloud/shared",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Code shared by every LibraCloud service: HTTP app setup, logging + CloudWatch metrics, JWT auth, database pool.",
+  "main": "index.js",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.21.2",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.13.1"
+  }
+}

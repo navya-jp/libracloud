@@ -1,0 +1,113 @@
+# LibraCloud API gateway (nginx)
+#  - serves the React website
+#  - routes /api/<service>/... to the matching microservice container
+#  - writes JSON access logs (shipped to CloudWatch Logs)
+#  - on AWS, only accepts traffic that came through CloudFront (secret header check)
+
+log_format json_access escape=json
+  '{"ts":"$time_iso8601","service":"gateway","msg":"access","method":"$request_method",'
+  '"uri":"$uri","status":$status,"bytes":$body_bytes_sent,"requestTimeMs":$request_time,'
+  '"upstreamTime":"$upstream_response_time","upstream":"$upstream_addr","requestId":"$request_id",'
+  '"clientIp":"$http_x_forwarded_for","userAgent":"$http_user_agent"}';
+
+# ORIGIN_VERIFY is set on AWS to a secret value that CloudFront adds to every request.
+# Requests that bypass CloudFront (direct to the EC2 IP) do not have it and are rejected.
+# Locally ORIGIN_VERIFY is empty, so requests without the header are allowed.
+map $http_x_origin_verify $origin_ok {
+  default 0;
+  "${ORIGIN_VERIFY}" 1;
+}
+
+# Block requests without the CloudFront header - except the container health check.
+map "$origin_ok:$uri" $origin_blocked {
+  default 1;
+  "~^1:" 0;
+  "0:/healthz" 0;
+}
+
+server {
+  listen 80 default_server;
+  server_name _;
+  server_tokens off;
+  root /usr/share/nginx/html;
+  access_log /dev/stdout json_access;
+  client_max_body_size 25m;
+
+  # Docker's internal DNS. Re-resolving every 10 s means that when one service container
+  # is replaced during a deployment, traffic moves to the new container automatically.
+  resolver 127.0.0.11 valid=10s ipv6=off;
+
+  gzip on;
+  gzip_types text/css application/javascript application/json image/svg+xml;
+  gzip_min_length 1024;
+
+  include /etc/nginx/snippets/security-headers.conf;
+
+  if ($origin_blocked) {
+    return 403;
+  }
+
+  # Container health check (Docker + monitoring). Not protected by the origin check.
+  location = /healthz {
+    access_log off;
+    default_type text/plain;
+    return 200 "ok\n";
+  }
+
+  # Internal service-to-service endpoints are never exposed publicly.
+  # (circulation /internal/overdue-run stays reachable for the scheduled Lambda; it is
+  #  protected by the x-internal-key header.)
+  location ~ ^/api/(auth|catalog|notifications)/internal/ {
+    return 404;
+  }
+
+  location /api/auth/ {
+    set $upstream auth:3000;
+    rewrite ^/api/auth/(.*)$ /$1 break;
+    proxy_pass http://$upstream;
+    include /etc/nginx/snippets/proxy.conf;
+  }
+
+  location /api/catalog/ {
+    set $upstream catalog:3000;
+    rewrite ^/api/catalog/(.*)$ /$1 break;
+    proxy_pass http://$upstream;
+    include /etc/nginx/snippets/proxy.conf;
+  }
+
+  location /api/circulation/ {
+    set $upstream circulation:3000;
+    rewrite ^/api/circulation/(.*)$ /$1 break;
+    proxy_pass http://$upstream;
+    include /etc/nginx/snippets/proxy.conf;
+  }
+
+  location /api/notifications/ {
+    set $upstream notification:3000;
+    rewrite ^/api/notifications/(.*)$ /$1 break;
+    proxy_pass http://$upstream;
+    include /etc/nginx/snippets/proxy.conf;
+  }
+
+  # Uploaded files in local development (on AWS, CloudFront serves /covers/* from S3).
+  location /files/ {
+    set $upstream catalog:3000;
+    proxy_pass http://$upstream;
+    include /etc/nginx/snippets/proxy.conf;
+  }
+
+  # Built JS/CSS have content hashes in their names - cache for a year.
+  location /assets/ {
+    try_files $uri =404;
+    expires 1y;
+    add_header Cache-Control "public, immutable" always;
+    include /etc/nginx/snippets/security-headers.conf;
+  }
+
+  # React single-page app: unknown paths return index.html.
+  location / {
+    try_files $uri /index.html;
+    add_header Cache-Control "no-cache" always;
+    include /etc/nginx/snippets/security-headers.conf;
+  }
+}

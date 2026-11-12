@@ -1,0 +1,12 @@
+**/node_modules
+**/dist
+**/uploads
+**/*.log
+.git
+.github
+docs
+infra
+data/*.csv
+!services/catalog/data/*.csv
+.env
+.env.*

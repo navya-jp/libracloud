@@ -1,0 +1,205 @@
+# LibraCloud CI/CD pipeline
+#
+#  push / pull request
+#     │
+#     ├─ detect-changes ── which services changed? (only those are rebuilt and redeployed)
+#     ├─ unit-tests ────── node --test for every service
+#     ├─ frontend-build ── React production build
+#     ├─ security-scan ─── npm audit (critical vulnerabilities fail the build)
+#     │
+#     ├─ integration ───── docker compose up + end-to-end smoke test (20 checks)
+#     │
+#     └─ build-and-push ── (main branch only) Docker image per CHANGED service → GitHub Container Registry
+#                          tags: latest + sha-<commit>
+#
+#  Deploy: the agent on EC2 (scripts/auto-deploy.sh) pulls new images every 2 minutes and
+#  recreates only the containers whose image changed. No AWS keys are stored in GitHub.
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      rebuild_all:
+        description: Rebuild and redeploy every service
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.result.outputs.services }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            auth:
+              - 'services/auth/**'
+              - 'services/shared/**'
+              - 'services/Dockerfile'
+            catalog:
+              - 'services/catalog/**'
+              - 'services/shared/**'
+              - 'services/Dockerfile'
+            circulation:
+              - 'services/circulation/**'
+              - 'services/shared/**'
+              - 'services/Dockerfile'
+            notification:
+              - 'services/notification/**'
+              - 'services/shared/**'
+              - 'services/Dockerfile'
+            gateway:
+              - 'frontend/**'
+              - 'gateway/**'
+      - id: result
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.rebuild_all }}" = "true" ]; then
+            echo 'services=["auth","catalog","circulation","notification","gateway"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'services=${{ steps.filter.outputs.changes }}' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Summary
+        run: echo "### Services changed in this commit → ${{ steps.result.outputs.services }}" >> "$GITHUB_STEP_SUMMARY"
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [auth, catalog, circulation, notification]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            services/shared/package-lock.json
+            services/${{ matrix.service }}/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: services/shared
+      - run: npm ci --no-audit --no-fund
+        working-directory: services/${{ matrix.service }}
+      - run: npm test
+        working-directory: services/${{ matrix.service }}
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: npm audit (production dependencies)
+        run: |
+          status=0
+          for dir in services/shared services/auth services/catalog services/circulation services/notification frontend; do
+            echo "::group::$dir"
+            (cd "$dir" && npm audit --omit=dev --audit-level=critical) || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+
+  integration:
+    needs: [unit-tests, frontend-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Start the full system (docker compose)
+        run: docker compose up -d --build --wait --wait-timeout 240
+      - name: End-to-end smoke test
+        env:
+          BASE_URL: http://localhost:8080
+          INTERNAL_API_KEY: local-dev-internal-key
+        run: node scripts/smoke-test.mjs
+      - name: Service logs (on failure)
+        if: failure()
+        run: docker compose logs --no-color --tail 200
+      - name: Stop
+        if: always()
+        run: docker compose down -v
+
+  build-and-push:
+    needs: [detect-changes, integration, security-scan]
+    if: github.event_name != 'pull_request' && needs.detect-changes.outputs.services != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.detect-changes.outputs.services) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image name and version
+        id: meta
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "image=ghcr.io/${owner}/libracloud-${{ matrix.service }}" >> "$GITHUB_OUTPUT"
+          echo "version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          if [ "${{ matrix.service }}" = "gateway" ]; then
+            echo "dockerfile=gateway/Dockerfile" >> "$GITHUB_OUTPUT"
+          else
+            echo "dockerfile=services/Dockerfile" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ steps.meta.outputs.dockerfile }}
+          push: true
+          build-args: |
+            SERVICE=${{ matrix.service }}
+            VERSION=${{ steps.meta.outputs.version }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:latest
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+      - name: Summary
+        run: |
+          echo "### ✅ ${{ matrix.service }} → \`${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "EC2 will deploy this image within ~2 minutes. Other services are not restarted." >> "$GITHUB_STEP_SUMMARY"

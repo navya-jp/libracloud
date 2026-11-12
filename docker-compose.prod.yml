@@ -1,0 +1,59 @@
+# LibraCloud - production on Amazon EC2
+#
+# Images are built by the GitHub Actions pipeline and pulled from GitHub Container Registry.
+# The database is Amazon RDS, files go to Amazon S3, emails go through Amazon SNS,
+# and every container's logs go to Amazon CloudWatch Logs.
+#
+# Values come from /opt/libracloud/.env, written by scripts/ec2-setup.sh from
+# AWS Secrets Manager and the CloudFormation stack (never committed to git).
+
+x-logging: &logging
+  driver: awslogs
+  options:
+    awslogs-region: ${AWS_REGION}
+    awslogs-group: ${LOG_GROUP}
+    tag: "{{.Name}}"
+
+x-service: &service
+  restart: unless-stopped
+  env_file: .env
+  logging: *logging
+  mem_limit: 256m
+  volumes:
+    - ./rds-ca.pem:/etc/ssl/rds-ca.pem:ro
+
+services:
+  auth:
+    <<: *service
+    image: ${IMAGE_PREFIX}/libracloud-auth:${TAG:-latest}
+    environment:
+      SERVICE_NAME: auth-service
+
+  catalog:
+    <<: *service
+    image: ${IMAGE_PREFIX}/libracloud-catalog:${TAG:-latest}
+    environment:
+      SERVICE_NAME: catalog-service
+
+  circulation:
+    <<: *service
+    image: ${IMAGE_PREFIX}/libracloud-circulation:${TAG:-latest}
+    environment:
+      SERVICE_NAME: circulation-service
+
+  notification:
+    <<: *service
+    image: ${IMAGE_PREFIX}/libracloud-notification:${TAG:-latest}
+    environment:
+      SERVICE_NAME: notification-service
+
+  gateway:
+    image: ${IMAGE_PREFIX}/libracloud-gateway:${TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    mem_limit: 128m
+    ports:
+      - "80:80"
+    environment:
+      ORIGIN_VERIFY: ${ORIGIN_VERIFY}
+    depends_on: [auth, catalog, circulation, notification]
