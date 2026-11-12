@@ -5,7 +5,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 const config = () => ({
   loanDays: Number(process.env.LOAN_DAYS || 14),
-  finePerDay: Number(process.env.FINE_PER_DAY || 5), // rupees per day late
+  finePerDay: Number(process.env.FINE_PER_DAY || 10), // rupees per day late
   maxFine: Number(process.env.MAX_FINE_PER_LOAN || 500), // cap per loan
   maxActiveLoans: Number(process.env.MAX_ACTIVE_LOANS || 3),
   maxUnpaidFines: Number(process.env.MAX_UNPAID_FINES || 100), // block borrowing above this
