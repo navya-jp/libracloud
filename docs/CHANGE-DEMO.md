@@ -66,7 +66,7 @@ The pipeline rebuilds circulation from the previous code and the agent deploys i
 | Source code | `services/circulation/` only | Git commit diff |
 | Build artifact | 1 new container image in GHCR; the other 4 unchanged | GitHub Actions summary, GHCR versions |
 | Running compute | 1 container replaced on EC2; instance not restarted; other containers untouched | deploy log, System status uptime |
-| Infrastructure (EC2, RDS, S3, CloudFront, IAM) | **No change** | CloudFormation stack has no update; CloudFront and RDS untouched |
+| Infrastructure (EC2, RDS, S3, API Gateway, IAM) | **No change** | CloudFormation stack has no update; API Gateway and RDS untouched |
 | Database schema / data | No change; existing loans and fines preserved | `CREATE TABLE IF NOT EXISTS` migrations are additive |
 | Configuration / secrets | No change | Secrets Manager versions unchanged |
 | Monitoring | New version visible in logs and metrics; `ServiceStarts` +1 | CloudWatch dashboard |
@@ -75,7 +75,7 @@ This is an **application-level, immutable, rolling deployment of a single micros
 
 ### Compare: an infrastructure change
 
-For contrast, change something in `infra/libracloud.yaml`, such as `InstanceType` from t3.small to t3.medium, and update the stack (CloudFormation → Update → replace template). First open the **change set**. CloudFormation lists exactly which resources will be modified, and whether each change is an in-place update or a **replacement**. For an instance-type change, EC2 is stopped and started (a few minutes of downtime) but keeps its Elastic IP, so CloudFront keeps working. 📸 the change set.
+For contrast, change something in `infra/libracloud.yaml`, such as `InstanceType` from t3.small to t3.medium, and update the stack (CloudFormation → Update → replace template). First open the **change set**. CloudFormation lists exactly which resources will be modified, and whether each change is an in-place update or a **replacement**. For an instance-type change, EC2 is stopped and started (a few minutes of downtime) but keeps its Elastic IP, so API Gateway keeps working. 📸 the change set.
 
 | Change type | Example | Tool | Downtime | Scope |
 |---|---|---|---|---|

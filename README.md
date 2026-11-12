@@ -7,27 +7,23 @@ LibraCloud is a library management system built as microservices and deployed on
 ```
                          Users (browser, HTTPS)
                                   │
-                       ┌──────────▼──────────┐
-                       │  Amazon CloudFront  │  HTTPS, edge caching, adds secret origin header
-                       └───┬─────────────┬───┘
-                 /*, /api/*│             │/covers/*
-                           │             ▼
-                           │     ┌───────────────┐
-                           │     │   Amazon S3   │  covers (public via CloudFront), e-books (pre-signed URLs), datasets
-                           │     └───────────────┘
-              ┌────────────▼─────────────────────────────────────────────┐
+                     ┌────────────▼────────────┐
+                     │  Amazon API Gateway     │  HTTPS URL, throttling, adds secret origin
+                     │  (HTTP API)             │  header + the visitor's real IP
+                     └────────────┬────────────┘
+              ┌───────────────────▼──────────────────────────────────────┐
               │ Amazon EC2 (t3.small, Elastic IP, LabInstanceProfile)    │
               │  Docker Compose                                          │
               │   gateway (nginx + React site) ─┬─ auth-service          │
-              │                                 ├─ catalog-service ──────┼──► S3
-              │                                 ├─ circulation-service   │
+              │                                 ├─ catalog-service ──────┼──► Amazon S3 (private:
+              │                                 ├─ circulation-service   │     covers, e-books, datasets)
               │                                 └─ notification-service ─┼──► Amazon SNS ──► email
               │   auto-deploy agent (cron, every 2 min)                  │
-              └────────────┬─────────────────────────────────────────────┘
-                           │ TLS, port 5432 (only from EC2's security group)
-                  ┌────────▼────────┐
-                  │  Amazon RDS     │  PostgreSQL, encrypted, private, daily backups
-                  └─────────────────┘
+              └───────────────────┬──────────────────────────────────────┘
+                                  │ TLS, port 5432 (only from EC2's security group)
+                         ┌────────▼────────┐
+                         │  Amazon RDS     │  PostgreSQL, encrypted, private, daily backups
+                         └─────────────────┘
 
   Amazon EventBridge (00:00 IST nightly) ──► AWS Lambda ──► /api/circulation/internal/overdue-run
   AWS Secrets Manager: DB password, JWT key, internal API key (read at boot, never in code)
@@ -35,14 +31,16 @@ LibraCloud is a library management system built as microservices and deployed on
   AWS CloudFormation: one template creates all of the above
 ```
 
+> **Why API Gateway and not CloudFront?** CloudFront is not available in AWS Academy Learner Lab. An API Gateway HTTP API gives the same benefits we need, a free HTTPS URL, request throttling and a secret header that locks the EC2 server behind it, and costs about $1 per million requests.
+
 ### The 10 AWS services
 
 | # | Service | Role in LibraCloud |
 |---|---|---|
 | 1 | **EC2** | Runs the five Docker containers |
 | 2 | **RDS (PostgreSQL)** | Books, members, loans, fines, notifications |
-| 3 | **S3** | Cover images, e-book PDFs, dataset files |
-| 4 | **CloudFront** | Public HTTPS URL, CDN, protects the origin |
+| 3 | **S3** | Cover images, e-book PDFs, dataset files (private bucket) |
+| 4 | **API Gateway** | Public HTTPS URL, throttling, protects the EC2 origin |
 | 5 | **CloudWatch** | Logs, metrics, alarms, dashboard |
 | 6 | **SNS** | Member emails and alarm alerts |
 | 7 | **Lambda** | Nightly overdue and fine calculation |
@@ -68,16 +66,16 @@ Each service has `/health` (version, uptime, database status), writes structured
 
 | Requirement | In this project |
 |---|---|
-| Cloud generation | `infra/libracloud.yaml`: CloudFormation creates all 35 resources in one stack (IaaS: EC2, VPC security groups; PaaS: RDS, Lambda, managed services) |
+| Cloud generation | `infra/libracloud.yaml`: CloudFormation creates all 39 resources in one stack (IaaS: EC2, VPC security groups; PaaS: RDS, Lambda, managed services) |
 | Cloud service usage | 10 AWS services, table above |
-| Hosted online, attached to the cloud | CloudFront HTTPS URL → EC2 → RDS / S3 / SNS |
+| Hosted online, attached to the cloud | API Gateway HTTPS URL → EC2 → RDS / S3 / SNS |
 | Backend / cloud ecosystem | 4 microservices + gateway, Lambda, EventBridge, SNS, Secrets Manager |
 | CI/CD pipeline design | `.github/workflows/ci-cd.yml` + `scripts/auto-deploy.sh` |
 | Monitor the service | CloudWatch dashboard (12 widgets), 8 alarms, `/health` endpoints, System status page |
 | Dataset | Kaggle goodbooks-10k / Goodreads importer + generated circulation history (`data/README.md`) |
 | Monitoring analysis | `scripts/loadgen.mjs` (CSV results) + CloudWatch metrics: latency p95, requests, errors, CPU, memory, RDS, business metrics |
 | What changes when services change | `docs/CHANGE-DEMO.md`: one-service rolling deploy, visible in logs, metrics and the status page |
-| Cloud security | Secrets Manager, private encrypted RDS (TLS verified), security groups, CloudFront-only origin, IMDSv2, bcrypt + JWT, rate limiting, roles, S3 block public access + pre-signed URLs, security headers, non-root containers, npm audit in CI |
+| Cloud security | Secrets Manager, private encrypted RDS (TLS verified), security groups, API-Gateway-only origin + throttling, IMDSv2, bcrypt + JWT, rate limiting, roles, S3 block public access + pre-signed URLs, security headers, non-root containers, npm audit in CI |
 | Costing | Resource sizes in the template; tags `Project=LibraCloud` for Cost Explorer |
 | SLA | Backed by alarms (latency p95 < 1 s, 5xx), RDS daily backups (RPO 24 h, or 5 min with point-in-time restore) |
 

@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
   LibraCloud - cloud-native library management system. Creates the complete AWS environment:
-  EC2 (Docker microservices), RDS PostgreSQL, S3, CloudFront, Lambda + EventBridge (nightly overdue job),
+  EC2 (Docker microservices), RDS PostgreSQL, S3, API Gateway (HTTPS entry point), Lambda + EventBridge (nightly overdue job),
   SNS (email), Secrets Manager, CloudWatch (logs, metrics, alarms, dashboard).
   Designed for AWS Academy Learner Lab (uses the existing LabRole / LabInstanceProfile).
 
@@ -11,7 +11,7 @@ Metadata:
       - Label: { default: 'Application' }
         Parameters: [GitHubRepo, GitBranch, ImagePrefix, AdminEmail, AdminPassword, AlertEmail]
       - Label: { default: 'Network' }
-        Parameters: [VpcId, SubnetIds, CloudFrontPrefixListId]
+        Parameters: [VpcId, SubnetIds]
       - Label: { default: 'Sizing (Learner Lab limits: EC2 up to large, RDS up to medium)' }
         Parameters: [InstanceType, DBInstanceClass, DBEngineVersion, KeyName, LatestAmiId]
       - Label: { default: 'Learner Lab IAM (do not change)' }
@@ -50,12 +50,6 @@ Parameters:
   SubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
     Description: Choose at least TWO public subnets in different Availability Zones (default VPC subnets are public). EC2 uses the first one.
-  CloudFrontPrefixListId:
-    Type: String
-    Default: ''
-    Description: >-
-      Optional but recommended. ID of the managed prefix list "com.amazonaws.global.cloudfront.origin-facing"
-      (VPC console > Managed prefix lists). When set, EC2 only accepts web traffic from CloudFront.
   InstanceType:
     Type: String
     Default: t3.small
@@ -85,7 +79,6 @@ Parameters:
 
 Conditions:
   HasKey: !Not [!Equals [!Ref KeyName, '']]
-  RestrictToCloudFront: !Not [!Equals [!Ref CloudFrontPrefixListId, '']]
   IsUsEast1: !Equals [!Ref 'AWS::Region', us-east-1]
 
 Resources:
@@ -133,10 +126,9 @@ Resources:
       GroupDescription: LibraCloud web server - HTTP only (no SSH; use Session Manager)
       VpcId: !Ref VpcId
       SecurityGroupIngress:
-        - !If
-          - RestrictToCloudFront
-          - { IpProtocol: tcp, FromPort: 80, ToPort: 80, SourcePrefixListId: !Ref CloudFrontPrefixListId, Description: CloudFront only }
-          - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: HTTP (protected by CloudFront secret header) }
+        # Open on port 80, but nginx rejects any request that does not carry the secret
+        # X-Origin-Verify header added by API Gateway - so the app is only reachable through API Gateway.
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: HTTP from API Gateway (secret header checked by nginx) }
       Tags: [{ Key: Name, Value: libracloud-web }, { Key: Project, Value: LibraCloud }]
 
   DbSecurityGroup:
@@ -220,14 +212,6 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Sid: CloudFrontReadsCovers
-            Effect: Allow
-            Principal: { Service: cloudfront.amazonaws.com }
-            Action: s3:GetObject
-            Resource: !Sub '${AssetsBucket.Arn}/covers/*'
-            Condition:
-              StringEquals:
-                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
           - Sid: DenyInsecureTransport
             Effect: Deny
             Principal: '*'
@@ -353,64 +337,80 @@ Resources:
       InstanceId: !Ref WebServer
       Tags: [{ Key: Name, Value: libracloud-web }, { Key: Project, Value: LibraCloud }]
 
-  # ------------------------------------------------------------------ CloudFront (HTTPS + CDN)
-  CoversOAC:
-    Type: AWS::CloudFront::OriginAccessControl
+  # ------------------------------------------------------------------ API Gateway (public HTTPS entry point)
+  # HTTP API in front of the EC2 gateway: free HTTPS URL, throttling (DoS protection), and a
+  # secret header that nginx checks so the EC2 server cannot be used directly.
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
     Properties:
-      OriginAccessControlConfig:
-        Name: !Sub '${AWS::StackName}-covers-oac'
-        OriginAccessControlOriginType: s3
-        SigningBehavior: always
-        SigningProtocol: sigv4
+      Name: !Sub '${AWS::StackName}-api'
+      Description: LibraCloud public HTTPS endpoint (forwards to the nginx gateway on EC2)
+      ProtocolType: HTTP
+      DisableExecuteApiEndpoint: false
+      Tags: { Project: LibraCloud }
 
-  Distribution:
-    Type: AWS::CloudFront::Distribution
+  ProxyIntegration:
+    Type: AWS::ApiGatewayV2::Integration
     Properties:
-      DistributionConfig:
-        Comment: LibraCloud library
-        Enabled: true
-        HttpVersion: http2and3
-        PriceClass: PriceClass_200            # includes edge locations in India
-        Origins:
-          - Id: ec2-gateway
-            DomainName: !Join
+      ApiId: !Ref HttpApi
+      Description: Every path -> nginx on EC2
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      PayloadFormatVersion: '1.0'
+      TimeoutInMillis: 30000
+      IntegrationUri: !Join
               - ''
-              - - 'ec2-'
+              - - 'http://ec2-'
                 - !Join ['-', !Split ['.', !GetAtt ElasticIP.PublicIp]]
                 - !If [IsUsEast1, '.compute-1.amazonaws.com', !Sub '.${AWS::Region}.compute.amazonaws.com']
-            CustomOriginConfig:
-              HTTPPort: 80
-              OriginProtocolPolicy: http-only
-              OriginReadTimeout: 30
-            OriginCustomHeaders:
-              - HeaderName: X-Origin-Verify
-                HeaderValue: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
-          - Id: s3-covers
-            DomainName: !GetAtt AssetsBucket.RegionalDomainName
-            S3OriginConfig: { OriginAccessIdentity: '' }
-            OriginAccessControlId: !GetAtt CoversOAC.Id
-        DefaultCacheBehavior:            # website + API: not cached
-          TargetOriginId: ec2-gateway
-          ViewerProtocolPolicy: redirect-to-https
-          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
-          CachedMethods: [GET, HEAD]
-          Compress: true
-          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad          # Managed-CachingDisabled
-          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # Managed-AllViewerExceptHostHeader
-        CacheBehaviors:
-          - PathPattern: /assets/*       # hashed JS/CSS: cached at the edge
-            TargetOriginId: ec2-gateway
-            ViewerProtocolPolicy: redirect-to-https
-            AllowedMethods: [GET, HEAD]
-            Compress: true
-            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6        # Managed-CachingOptimized
-          - PathPattern: /covers/*       # book covers straight from S3
-            TargetOriginId: s3-covers
-            ViewerProtocolPolicy: redirect-to-https
-            AllowedMethods: [GET, HEAD]
-            Compress: true
-            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
-      Tags: [{ Key: Project, Value: LibraCloud }]
+                - '/{proxy}'
+      RequestParameters:
+        'overwrite:header.X-Origin-Verify': !Select [2, !Split ['/', !Ref 'AWS::StackId']]
+        'overwrite:header.X-Client-Ip': '$context.identity.sourceIp'
+
+  RootIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      Description: Home page -> nginx on EC2
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      PayloadFormatVersion: '1.0'
+      TimeoutInMillis: 30000
+      IntegrationUri: !Join
+              - ''
+              - - 'http://ec2-'
+                - !Join ['-', !Split ['.', !GetAtt ElasticIP.PublicIp]]
+                - !If [IsUsEast1, '.compute-1.amazonaws.com', !Sub '.${AWS::Region}.compute.amazonaws.com']
+                - '/'
+      RequestParameters:
+        'overwrite:header.X-Origin-Verify': !Select [2, !Split ['/', !Ref 'AWS::StackId']]
+        'overwrite:header.X-Client-Ip': '$context.identity.sourceIp'
+
+  ProxyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'ANY /{proxy+}'
+      Target: !Sub 'integrations/${ProxyIntegration}'
+
+  RootRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'ANY /'
+      Target: !Sub 'integrations/${RootIntegration}'
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 100     # requests per second
+        ThrottlingBurstLimit: 200
+      Tags: { Project: LibraCloud }
 
   # ------------------------------------------------------------------ Lambda + EventBridge (nightly overdue job)
   OverdueJobLogGroup:
@@ -421,7 +421,7 @@ Resources:
 
   OverdueJobFunction:
     Type: AWS::Lambda::Function
-    DependsOn: OverdueJobLogGroup
+    DependsOn: [OverdueJobLogGroup, ProxyRoute, ApiStage]
     Properties:
       FunctionName: !Sub '${AWS::StackName}-overdue-job'
       Description: Nightly - marks overdue loans, recalculates fines, sends due-date reminders
@@ -432,7 +432,7 @@ Resources:
       MemorySize: 128
       Environment:
         Variables:
-          API_URL: !Sub 'https://${Distribution.DomainName}'
+          API_URL: !GetAtt HttpApi.ApiEndpoint
           INTERNAL_SECRET_ARN: !Ref InternalKeySecret
       Code:
         ZipFile: |
@@ -643,10 +643,12 @@ Resources:
                   ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${Database}", { "label": "CPU %", "stat": "Average" }],
                   ["AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "${Database}", { "label": "Connections", "stat": "Average", "yAxis": "right" }] ] } },
             { "type": "metric", "x": 16, "y": 7, "width": 8, "height": 6,
-              "properties": { "title": "CloudFront", "region": "us-east-1", "period": 300, "view": "timeSeries",
+              "properties": { "title": "API Gateway (all user traffic)", "region": "${AWS::Region}", "period": 60, "view": "timeSeries",
                 "metrics": [
-                  ["AWS/CloudFront", "Requests", "Region", "Global", "DistributionId", "${Distribution}", { "stat": "Sum", "label": "Requests" }],
-                  ["AWS/CloudFront", "5xxErrorRate", "Region", "Global", "DistributionId", "${Distribution}", { "stat": "Average", "label": "5xx rate %", "yAxis": "right" }] ] } },
+                  ["AWS/ApiGateway", "Count", "ApiId", "${HttpApi}", { "stat": "Sum", "label": "Requests" }],
+                  ["AWS/ApiGateway", "5xx", "ApiId", "${HttpApi}", { "stat": "Sum", "label": "5xx" }],
+                  ["AWS/ApiGateway", "4xx", "ApiId", "${HttpApi}", { "stat": "Sum", "label": "4xx" }],
+                  ["AWS/ApiGateway", "Latency", "ApiId", "${HttpApi}", { "stat": "p95", "label": "Latency p95 (ms)", "yAxis": "right" }] ] } },
             { "type": "metric", "x": 0, "y": 13, "width": 12, "height": 6,
               "properties": { "title": "Library activity (per hour)", "region": "${AWS::Region}", "stat": "Sum", "period": 3600, "view": "timeSeries",
                 "metrics": [
@@ -677,8 +679,8 @@ Resources:
 
 Outputs:
   WebsiteURL:
-    Description: Open this to use LibraCloud (HTTPS through CloudFront)
-    Value: !Sub 'https://${Distribution.DomainName}'
+    Description: Open this to use LibraCloud (HTTPS through API Gateway)
+    Value: !GetAtt HttpApi.ApiEndpoint
   ElasticIP:
     Description: Public IP of the EC2 server (direct access is blocked - use the WebsiteURL)
     Value: !GetAtt ElasticIP.PublicIp

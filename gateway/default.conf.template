@@ -2,23 +2,30 @@
 #  - serves the React website
 #  - routes /api/<service>/... to the matching microservice container
 #  - writes JSON access logs (shipped to CloudWatch Logs)
-#  - on AWS, only accepts traffic that came through CloudFront (secret header check)
+#  - on AWS, only accepts traffic that came through API Gateway (secret header check)
 
 log_format json_access escape=json
   '{"ts":"$time_iso8601","service":"gateway","msg":"access","method":"$request_method",'
   '"uri":"$uri","status":$status,"bytes":$body_bytes_sent,"requestTimeMs":$request_time,'
   '"upstreamTime":"$upstream_response_time","upstream":"$upstream_addr","requestId":"$request_id",'
-  '"clientIp":"$http_x_forwarded_for","userAgent":"$http_user_agent"}';
+  '"clientIp":"$real_client_ip","userAgent":"$http_user_agent"}';
 
-# ORIGIN_VERIFY is set on AWS to a secret value that CloudFront adds to every request.
-# Requests that bypass CloudFront (direct to the EC2 IP) do not have it and are rejected.
+# ORIGIN_VERIFY is set on AWS to a secret value that API Gateway adds to every request.
+# Requests that bypass API Gateway (direct to the EC2 IP) do not have it and are rejected.
 # Locally ORIGIN_VERIFY is empty, so requests without the header are allowed.
 map $http_x_origin_verify $origin_ok {
   default 0;
   "${ORIGIN_VERIFY}" 1;
 }
 
-# Block requests without the CloudFront header - except the container health check.
+# The visitor's real IP: API Gateway sends it in X-Client-Ip (overwriting anything the client sent).
+# Used for login rate limiting and access logs.
+map $http_x_client_ip $real_client_ip {
+  default $http_x_client_ip;
+  "" $remote_addr;
+}
+
+# Block requests without the API Gateway header - except the container health check.
 map "$origin_ok:$uri" $origin_blocked {
   default 1;
   "~^1:" 0;
@@ -31,7 +38,7 @@ server {
   server_tokens off;
   root /usr/share/nginx/html;
   access_log /dev/stdout json_access;
-  client_max_body_size 25m;
+  client_max_body_size 10m;   # API Gateway limit is 10 MB
 
   # Docker's internal DNS. Re-resolving every 10 s means that when one service container
   # is replaced during a deployment, traffic moves to the new container automatically.
@@ -89,7 +96,7 @@ server {
     include /etc/nginx/snippets/proxy.conf;
   }
 
-  # Uploaded files in local development (on AWS, CloudFront serves /covers/* from S3).
+  # Book covers (from S3 on AWS, from disk locally) and local e-book files.
   location /files/ {
     set $upstream catalog:3000;
     proxy_pass http://$upstream;

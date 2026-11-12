@@ -2,7 +2,7 @@
 // LibraCloud load generator - creates realistic traffic for the monitoring analysis.
 // No installation needed (Node.js 18+).
 //
-//   node scripts/loadgen.mjs --url https://dxxxx.cloudfront.net --users 20 --duration 300
+//   node scripts/loadgen.mjs --url https://xxxx.execute-api.us-east-1.amazonaws.com --users 20 --duration 300
 //
 // Each virtual user behaves like a library visitor: browses and searches the catalogue
 // (most traffic), opens book pages, and sometimes logs in to view loans or borrow.
@@ -128,7 +128,7 @@ async function main() {
     ['time,requests,errors,avg_latency_ms', ...[...timeline.entries()].sort().map(([s, t]) => `${new Date(s * 1000).toISOString()},${t.n},${t.err},${(t.total / t.n).toFixed(1)}`)].join('\n'));
   console.log(`Results saved to ${dir}`);
   const c4 = rows.reduce((a, r) => a + r.c4, 0);
-  if (c4 > total * 0.5) console.log('\n⚠ Most requests returned 4xx - check the URL, the CloudFront origin header or the member password.');
+  if (c4 > total * 0.5) console.log('\n⚠ Most requests returned 4xx - check the URL, that you used the API Gateway WebsiteURL or the member password.');
 }
 
 main();

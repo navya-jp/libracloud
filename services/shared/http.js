@@ -14,7 +14,8 @@ const startedAt = Date.now();
 function createApp() {
   const app = express();
   app.disable('x-powered-by');
-  // Number of proxies in front of the service: nginx locally (1), CloudFront + nginx on AWS (2).
+  // Number of proxies in front of the service: nginx (1). nginx passes the visitor's real IP
+  // (from API Gateway's X-Client-Ip header on AWS) in X-Forwarded-For.
   app.set('trust proxy', Number(process.env.TRUST_PROXY || 1));
   app.use(helmet());
   app.use(express.json({ limit: '100kb' }));

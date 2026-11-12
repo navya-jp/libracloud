@@ -53,7 +53,7 @@ function BookForm({ book, onClose, onSaved }) {
             <label className="btn secondary sm" style={{ margin: 0, cursor: 'pointer' }}>
               {book.hasEbook ? 'Replace e-book (PDF)' : 'Upload e-book (PDF)'}<input type="file" accept="application/pdf" hidden onChange={upload('ebook')} disabled={busy} />
             </label>
-            <span className="small muted">Files are stored in Amazon S3.</span>
+            <span className="small muted">Stored in Amazon S3 · cover up to 2 MB, PDF up to 10 MB.</span>
           </div>
         )}
         <div className="modal-foot">

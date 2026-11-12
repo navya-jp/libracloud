@@ -11,13 +11,24 @@ const { buildSearch, adjustCopies, publicBook } = require('./books');
 
 const app = createApp();
 
-// Local development only: serve uploaded files from disk. On AWS, CloudFront serves
-// covers directly from S3 and e-books use pre-signed S3 URLs.
-if (!storage.usingS3()) {
+// Cover images. On AWS they are streamed from the private S3 bucket (the bucket itself is
+// never public); locally they are served from disk. E-books use pre-signed S3 URLs instead.
+if (storage.usingS3()) {
+  app.get('/files/covers/:name', asyncHandler(async (req, res) => {
+    const name = require('path').basename(req.params.name);
+    const obj = await storage.getObject(`covers/${name}`);
+    if (!obj) throw new HttpError(404, 'Cover not found');
+    res.setHeader('content-type', obj.ContentType || 'image/jpeg');
+    res.setHeader('cache-control', 'public, max-age=604800');
+    if (obj.ContentLength) res.setHeader('content-length', obj.ContentLength);
+    obj.Body.pipe(res);
+  }));
+} else {
   app.use('/files', express.static(storage.LOCAL_DIR, { maxAge: '1d', fallthrough: false }));
 }
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024, files: 1 } });
+// 10 MB is the largest request API Gateway accepts.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1 } });
 const IMAGE_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' };
 
 function bookFields(body, { partial = false } = {}) {

@@ -3,7 +3,7 @@
 // Used by the CI/CD pipeline and after every deployment.
 //
 //   node scripts/smoke-test.mjs                         # local docker compose (http://localhost:8080)
-//   BASE_URL=https://dxxxx.cloudfront.net node scripts/smoke-test.mjs   # deployed site
+//   BASE_URL=https://xxxx.execute-api.us-east-1.amazonaws.com node scripts/smoke-test.mjs   # deployed site
 //
 // Env: BASE_URL, ADMIN_EMAIL, ADMIN_PASSWORD, INTERNAL_API_KEY (optional, tests the overdue job)
 
